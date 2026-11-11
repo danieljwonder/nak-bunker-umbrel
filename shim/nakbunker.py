@@ -24,7 +24,7 @@ HOME = os.environ.get("NAK_HOME", "/data")
 CONFIG = os.path.join(HOME, ".config", "nak", "bunker", "default")
 PORT = int(os.environ.get("PORT", "8080"))
 DEFAULT_RELAYS = [r for r in os.environ.get(
-    "DEFAULT_RELAYS", "wss://relay.nsec.app,wss://nostr.oxtr.dev,wss://offchain.pub,wss://relay.damus.io").split(",") if r]
+    "DEFAULT_RELAYS", "wss://nostr.oxtr.dev,wss://offchain.pub,wss://relay.snort.social,wss://relay.damus.io").split(",") if r]
 CSRF = secrets.token_urlsafe(24)
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\x1b[=>]|[\x00-\x08\x0b-\x1f\x7f]")
@@ -42,6 +42,21 @@ def mask(s, pw=None):
     if pw:
         s = s.replace(pw, "•••")
     return s
+
+
+def short_relay_error(msg):
+    """One short reason for the UI; the full text stays in the log."""
+    m = re.search(r"(?:but got|HTTP/\S+) (\d{3})", msg)
+    if m:
+        return "HTTP " + m.group(1)
+    if "expected handshake" in msg:
+        return "refused (relay busy or blocking)"
+    for k, v in (("no such host", "DNS lookup failed"), ("timeout", "timed out"), ("deadline", "timed out"),
+                 ("connection refused", "connection refused"), ("certificate", "TLS error"),
+                 ("failed to send handshake", "unreachable")):
+        if k in msg.lower():
+            return v
+    return "failed"
 
 
 def read_config():
@@ -248,7 +263,7 @@ class Bunker:
         if m:
             url, rest = m.group(1), m.group(2).strip()
             if rest:
-                self.relay_status[url] = "ok" if rest.startswith("ok") else rest[:120]
+                self.relay_status[url] = "ok" if rest.startswith("ok") else short_relay_error(rest)
         m = BUNKER_LINE.search(line)
         if m:
             self.bunker_uri = m.group(1)
