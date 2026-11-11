@@ -29,6 +29,9 @@ This is a thin port in the style of [hermes-agent-umbrel](https://github.com/get
 - **Status:** relay connection results, the log (keys, secrets and passwords masked), and the
   `bunker://` URI to connect a new app.
 - **Relays:** edit the list (nak restarts). nak reconnects to dropped relays on its own.
+  New installs start with `relay.nip46.com`, `nrs.primal.net` and `bucket.coracle.social`, the
+  remote-signing relays Amethyst, Amber and Opal use by default. Adding a large general relay
+  such as `relay.damus.io` as a fallback is reasonable.
 - **Authorised apps:** list and remove.
 
 There is no built-in monitoring or notification service. Use whatever you already have.

@@ -24,7 +24,7 @@ HOME = os.environ.get("NAK_HOME", "/data")
 CONFIG = os.path.join(HOME, ".config", "nak", "bunker", "default")
 PORT = int(os.environ.get("PORT", "8080"))
 DEFAULT_RELAYS = [r for r in os.environ.get(
-    "DEFAULT_RELAYS", "wss://nostr.oxtr.dev,wss://offchain.pub,wss://relay.snort.social,wss://relay.damus.io").split(",") if r]
+    "DEFAULT_RELAYS", "wss://relay.nip46.com,wss://nrs.primal.net,wss://bucket.coracle.social").split(",") if r]
 CSRF = secrets.token_urlsafe(24)
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\x1b[=>]|[\x00-\x08\x0b-\x1f\x7f]")

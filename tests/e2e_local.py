@@ -10,7 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SHIM = os.path.join(HERE, "..", "shim", "nakbunker.py")
 NAK = os.environ["NAK_BIN"]
 PORT = int(os.environ.get("TEST_PORT", "18951"))
-RELAYS = os.environ.get("TEST_RELAYS", "wss://nostr.oxtr.dev\nwss://offchain.pub\nwss://relay.snort.social")
+RELAYS = os.environ.get("TEST_RELAYS", "wss://relay.nip46.com\nwss://nrs.primal.net\nwss://bucket.coracle.social")
 PW = "correct horse battery"
 FAILS = 0
 
