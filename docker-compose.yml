@@ -1,0 +1,11 @@
+# Local run without Umbrel (dashboard on http://localhost:8080; put it behind auth
+# if the port is reachable by anyone else).
+services:
+  nak-bunker:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
