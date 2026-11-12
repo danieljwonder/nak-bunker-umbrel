@@ -34,7 +34,33 @@ This is a thin port in the style of [hermes-agent-umbrel](https://github.com/get
   such as `relay.damus.io` as a fallback is reasonable.
 - **Authorised apps:** list and remove.
 
-There is no built-in monitoring or notification service. Use whatever you already have.
+- **Locked reminders (optional, on by default after the first unlock):** if the bunker waits at
+  its password prompt for 10 minutes, for example after a power cut or update, it sends you an
+  encrypted Nostr DM, then one a day until you unlock it. Details below.
+
+## Locked reminders
+
+After every restart the bunker is locked until you enter your password, and it's easy to forget.
+The reminder is a NIP-17 direct message (kind 14, sealed and gift-wrapped per NIP-59, built by
+nak itself):
+
+- It comes from a **notifier key unique to your install**, generated on first use with the
+  operating system's secure random generator. It can only send these notices and never signs as
+  you. Its npub is shown on the page so you can add it as a contact if your app hides messages
+  from strangers.
+- It goes to your DM relays (your kind 10050 list), else the read relays in your kind 10002 list,
+  else a few large public relays.
+- Your npub is remembered from the last successful unlock, because it can't be read while the
+  key is locked.
+- Messages contain **no links**. A forged message therefore can't send you to a fake password
+  page: always unlock from your own Umbrel.
+- Only apps that support NIP-17 direct messages show them. Apps limited to the older NIP-04
+  format won't.
+- **Send test DM** on the page checks delivery. The delay and interval can be changed with
+  `LOCK_NOTIFY_SECS` and `LOCK_REMIND_SECS`.
+
+The bunker can't tell you anything while your Umbrel is off or offline; that needs a monitor
+running somewhere else.
 
 ## Data
 

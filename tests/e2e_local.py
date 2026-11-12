@@ -51,8 +51,14 @@ def wait(pred, secs=60):
     return status()
 
 
-def start_shim(home):
-    env = dict(os.environ, NAK_BIN=NAK, NAK_HOME=home, PORT=str(PORT))
+DM_RELAY = os.environ.get("TEST_DM_RELAY", "wss://bucket.coracle.social")
+USER_SEC = subprocess.run([NAK, "key", "generate"], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip()
+USER_PUB = subprocess.run([NAK, "key", "public", USER_SEC], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip()
+
+
+def start_shim(home, **extra):
+    env = dict(os.environ, NAK_BIN=NAK, NAK_HOME=home, PORT=str(PORT), FALLBACK_DM_RELAYS=DM_RELAY,
+               LOOKUP_RELAYS=DM_RELAY, **extra)
     p = subprocess.Popen([sys.executable, "-I", SHIM], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     for _ in range(50):
         try:
@@ -66,6 +72,23 @@ def start_shim(home):
 
 
 CLIENT_HEX = os.urandom(32).hex()
+
+
+def inbox(since):
+    """Unwrap every NIP-17 DM to the test user on the DM relay since `since`; return (rumor, wrap) pairs."""
+    req = subprocess.run([NAK, "req", "-k", "1059", "-p", USER_PUB, DM_RELAY], capture_output=True, text=True,
+                         timeout=60, stdin=subprocess.DEVNULL)
+    out = []
+    for line in req.stdout.splitlines():
+        u = subprocess.run([NAK, "gift", "unwrap"], input=line, capture_output=True, text=True, timeout=30,
+                           env=dict(os.environ, NOSTR_SECRET_KEY=USER_SEC))
+        try:
+            r = json.loads(u.stdout.strip().splitlines()[-1])
+        except Exception:
+            continue
+        if r.get("created_at", 0) >= since - 5:
+            out.append((r, json.loads(line)))
+    return out
 
 
 def client(uri, mode=""):
@@ -89,8 +112,8 @@ try:
           post("/api/setup", {"mode": "import-ncryptsec", "key": "ncryptsec1qgg9947rlpvqu76pj5ecreduf9jxhselq2nae2kghhvd5g7dgjtcxfqtd67p9m0w57lspw8gsq6yphnm8623nsl8xn9j4jdzz84zm3frztj3z7s35vpzmqf6ksu8r89qk5z2zxfmu5gv8th8wclt0h4p", "password": "wrong password!!", "relays": RELAYS}, tok)[0] == 400)
     check("still no config written", not os.path.exists(os.path.join(home, ".config/nak/bunker/default")))
 
-    code, _ = post("/api/setup", {"mode": "generate", "password": PW, "relays": RELAYS}, tok)
-    check("setup (generate) accepted", code == 200)
+    code, _ = post("/api/setup", {"mode": "import-nsec", "key": USER_SEC, "password": PW, "relays": RELAYS}, tok)
+    check("setup (import hex key) accepted", code == 200)
     cfg = json.load(open(os.path.join(home, ".config/nak/bunker/default")))
     check("config holds only an encrypted key", cfg["sec"].startswith("ncryptsec1"))
     check("config file mode 600", oct(os.stat(os.path.join(home, ".config/nak/bunker/default")).st_mode & 0o777) == "0o600")
@@ -123,15 +146,47 @@ try:
     code, _ = post("/api/relays", {"relays": RELAYS + "\nwss://relay.damus.io"}, tok)
     s = wait(lambda s: s["state"] == "running" and "wss://relay.damus.io" in s["relays"], 90)
     check("relay list edited and nak restarted", s["state"] == "running" and len(s["relays"]) == 4)
+
+    # ---- locked reminders: test DM
+    check("owner npub learned at unlock", s["notify"]["ready"] and s["notify"]["enabled"])
+    # publish a NIP-17 DM relay list (kind 10050) for the test user, so delivery must use it
+    subprocess.run([NAK, "event", "-k", "10050", "-t", "relay=" + DM_RELAY, DM_RELAY], capture_output=True, text=True,
+                   timeout=60, stdin=subprocess.DEVNULL, env=dict(os.environ, NOSTR_SECRET_KEY=USER_SEC))
+    time.sleep(2)
+    t0 = int(time.time())
+    code, j = post("/api/notify/test", {}, tok)
+    check("test DM accepted by a relay", code == 200, str(j))
+    check("delivered via the owner's kind 10050 DM relays", "kind 10050" in j.get("message", ""), str(j))
+    st = json.load(open(os.path.join(home, "nakbunker-shim.json")))
+    check("state file mode 600", oct(os.stat(os.path.join(home, "nakbunker-shim.json")).st_mode & 0o777) == "0o600")
+    time.sleep(3)
+    msgs = inbox(t0)
+    r = next((m for m in msgs if "Test from nak bunker" in m[0].get("content", "")), None)
+    check("test DM arrives and unwraps for the owner (NIP-17 kind 14)", r is not None and r[0]["kind"] == 14, str(len(msgs)))
+    if r:
+        check("rumor is from this install's notifier key, not the owner", r[0]["pubkey"] == st.get("notifier_pub") != USER_PUB)
+        check("outer wrap signed by a one-time key", r[1]["pubkey"] not in (st.get("notifier_pub"), USER_PUB))
+        check("message has no links", "http" not in r[0]["content"] and "://" not in r[0]["content"])
+    s = status()
+    check("notifier secret never exposed", st.get("notifier_sec", "x") not in json.dumps(s) + json.dumps(s["log"]))
 finally:
     p.send_signal(signal.SIGTERM)
     p.wait(timeout=15)
 
-# app restart: password is gone, wrong then right
-p, tok = start_shim(home)
+# app restart: password is gone; reminder fires while locked; then wrong and right passwords
+p, tok = start_shim(home, LOCK_NOTIFY_SECS="5")
 try:
     s = wait(lambda s: s["state"] == "locked", 30)
     check("after app restart: locked, waiting for password", s["state"] == "locked")
+    t0 = int(time.time())
+    before = s["notify"]["last"]
+    s = wait(lambda s: s["notify"]["last"] and s["notify"]["last"] != before, 90)
+    check("locked reminder sent automatically", s["notify"]["last"] != before, s["notify"]["last_result"])
+    time.sleep(3)
+    check("locked reminder arrives and unwraps", any("restarted and is locked" in m[0].get("content", "") for m in inbox(t0)))
+    last = s["notify"]["last"]
+    time.sleep(35)
+    check("no repeat within the reminder interval", status()["notify"]["last"] == last)
     post("/api/unlock", {"password": "not the password", "remember": "1"}, tok)
     s = wait(lambda s: "Wrong" in s["message"], 30)
     check("wrong password reported", "Wrong" in s["message"], s["message"])
@@ -144,6 +199,19 @@ try:
     code, _ = post("/api/client/remove", {"pubkey": client_pk}, tok)
     s = wait(lambda s: len(s["clients"]) == 0, 20)
     check("client removed", code == 200 and len(s["clients"]) == 0)
+finally:
+    p.send_signal(signal.SIGTERM)
+    p.wait(timeout=15)
+
+# unlocking before the delay sends nothing
+p, tok = start_shim(home, LOCK_NOTIFY_SECS="40")
+try:
+    s = wait(lambda s: s["state"] == "locked", 30)
+    last = s["notify"]["last"]
+    post("/api/unlock", {"password": PW, "remember": ""}, tok)
+    s = wait(lambda s: s["state"] == "running", 60)
+    time.sleep(55)
+    check("unlocked before the delay: no reminder sent", status()["notify"]["last"] == last)
 finally:
     p.send_signal(signal.SIGTERM)
     p.wait(timeout=15)

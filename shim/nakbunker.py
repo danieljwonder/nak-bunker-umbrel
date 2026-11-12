@@ -76,6 +76,155 @@ def write_config(cfg):
     os.replace(tmp, CONFIG)
 
 
+# ---------------------------------------------------------------- locked reminders (NIP-17 DMs)
+#
+# When nak sits at its password prompt for LOCK_NOTIFY_SECS, send the owner a NIP-17 DM (kind 14
+# rumor, sealed and gift-wrapped per NIP-59, built by nak itself) from a per-install notifier key,
+# then a reminder every LOCK_REMIND_SECS while it stays locked. The notifier key is generated with
+# nak (OS CSPRNG) on first use, is unique to this install and can only send these notices. The
+# owner's pubkey is remembered from the last successful unlock (it can't be read while locked).
+# Messages contain no links, so a forged one can't send anyone to a fake password page.
+
+STATE_FILE = os.path.join(HOME, "nakbunker-shim.json")
+LOCK_NOTIFY_SECS = int(os.environ.get("LOCK_NOTIFY_SECS", "600"))
+LOCK_REMIND_SECS = int(os.environ.get("LOCK_REMIND_SECS", "86400"))
+LOOKUP_RELAYS = [r for r in os.environ.get(
+    "LOOKUP_RELAYS", "wss://purplepag.es,wss://user.kindpag.es,wss://relay.damus.io,wss://relay.primal.net").split(",") if r]
+FALLBACK_DM_RELAYS = [r for r in os.environ.get(
+    "FALLBACK_DM_RELAYS", "wss://relay.damus.io,wss://relay.primal.net,wss://nos.lol").split(",") if r]
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            s = json.load(f)
+            return s if isinstance(s, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_state(s):
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(s, f, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+def nak_io(args, stdin=None, sec=None, timeout=60):
+    """Run nak with optional stdin; a key goes in via env, never argv or logs."""
+    env = {"HOME": HOME, "PATH": "/usr/bin:/bin"}
+    if sec:
+        env["NOSTR_SECRET_KEY"] = sec
+    # nak treats a piped stdin as event/filter input, so give it /dev/null when there is none:
+    # an empty pipe makes `nak req` silently ignore its command-line filters.
+    io = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    p = subprocess.run([NAK] + args, capture_output=True, text=True, timeout=timeout, env=env, **io)
+    return p.returncode, p.stdout, p.stderr
+
+
+class Notifier:
+    def __init__(self, bunker):
+        self.b = bunker
+        self.lock = threading.Lock()
+        self.busy = False
+
+    def state(self):
+        return load_state()
+
+    def notifier_key(self):
+        s = load_state()
+        if not HEX64.match(s.get("notifier_sec", "")):
+            code, out, _ = nak_io(["key", "generate"])
+            sec = out.strip()
+            if code != 0 or not HEX64.match(sec):
+                raise ValueError("could not generate a notifier key")
+            s["notifier_sec"] = sec
+            code, out, _ = nak_io(["key", "public", sec])
+            s["notifier_pub"] = out.strip()
+            code, out, _ = nak_io(["encode", "npub", s["notifier_pub"]])
+            s["notifier_npub"] = out.strip()
+            save_state(s)
+        return s["notifier_sec"]
+
+    def dm_relays(self, pub):
+        """NIP-17: the recipient's kind 10050 relays; else their kind 10002 read relays; else fallbacks."""
+        lookup = list(dict.fromkeys(LOOKUP_RELAYS + (read_config() or {}).get("relays", [])))
+        code, out, _ = nak_io(["req", "-k", "10050", "-k", "10002", "-a", pub, "-l", "10"] + lookup, timeout=30)
+        newest = {}
+        for line in out.splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("pubkey") == pub and e.get("created_at", 0) > newest.get(e.get("kind"), {}).get("created_at", -1):
+                newest[e["kind"]] = e
+        dm = [t[1] for t in newest.get(10050, {}).get("tags", []) if len(t) > 1 and t[0] == "relay"]
+        if dm:
+            return dm[:8], "your DM relays (kind 10050)"
+        rd = [t[1] for t in newest.get(10002, {}).get("tags", [])
+              if len(t) > 1 and t[0] == "r" and (len(t) == 2 or t[2] == "read")]
+        if rd:
+            return rd[:8], "your read relays (kind 10002)"
+        return FALLBACK_DM_RELAYS, "fallback relays (no kind 10050 or 10002 found)"
+
+    def send(self, text):
+        """Returns (accepted, tried, where). Never raises for relay failures."""
+        s = load_state()
+        pub = s.get("user_pubkey", "")
+        if not HEX64.match(pub):
+            raise ValueError("Unlock once first, so the bunker knows which npub to message.")
+        sec = self.notifier_key()
+        relays, where = self.dm_relays(pub)
+        code, rumor, err = nak_io(["event", "-k", "14", "-p", pub, "-c", text], sec=sec)
+        if code != 0:
+            raise ValueError("nak could not build the message")
+        code, wrap, err = nak_io(["gift", "wrap", "-p", pub], stdin=rumor, sec=sec)
+        if code != 0 or '"kind":1059' not in wrap.replace(" ", ""):
+            raise ValueError("nak could not gift-wrap the message")
+        code, out, err = nak_io(["event"] + relays, stdin=wrap, timeout=60)
+        accepted = len(re.findall(r"publishing to \S+\.\.\. success", err))
+        s = load_state()
+        s["last_notice"] = int(time.time())
+        s["last_notice_result"] = f"{accepted}/{len(relays)} relays accepted ({where})"
+        save_state(s)
+        self.b.add_log(f"[shim] notice sent: {s['last_notice_result']}")
+        return accepted, len(relays), where
+
+    def loop(self):
+        while True:
+            time.sleep(15)
+            try:
+                self.tick()
+            except Exception as e:  # never let the reminder thread die
+                self.b.add_log(f"[shim] reminder error: {type(e).__name__}")
+
+    def tick(self):
+        b = self.b
+        with b.lock:
+            since = b.locked_since if (b.state == "locked" and b.proc_pid) else None
+            last = b.episode_notice
+        s = load_state()
+        if since is None or not s.get("notify", True) or not HEX64.match(s.get("user_pubkey", "")):
+            return
+        now = time.time()
+        if now - since < LOCK_NOTIFY_SECS:
+            return
+        if last and now - last < LOCK_REMIND_SECS:
+            return
+        if last:
+            hrs = int((now - since) // 3600)
+            text = (f"Your nak bunker is still locked ({hrs} h). Apps can't sign until you open "
+                    "your nak bunker page and enter your password.")
+        else:
+            text = ("Your nak bunker restarted and is locked. Apps can't sign until you open "
+                    "your nak bunker page and enter your password.")
+        with b.lock:
+            b.episode_notice = now  # set before sending: a relay outage must not cause a burst
+        self.send(text)
+
+
 def has_encrypted_key(cfg):
     return bool(cfg) and isinstance(cfg.get("sec"), str) and cfg["sec"].startswith("ncryptsec1")
 
@@ -111,6 +260,8 @@ class Bunker:
         self.wrong_pw = False
         self.answered_attempt = 0
         self.awaiting_attempt = 0
+        self.locked_since = None   # start of the current locked episode (for reminders)
+        self.episode_notice = None
         self.want_running = True
         self._line = ""
 
@@ -239,6 +390,8 @@ class Bunker:
                         self.message = "Unlocking…"
                     else:
                         self.awaiting_attempt = attempt
+                        if self.locked_since is None:
+                            self.locked_since = time.time()
             if P_SEC in flat and not self.prompt_answered:
                 # Should not happen (we always pre-write the config); refuse to
                 # type a key into nak from here.
@@ -267,8 +420,16 @@ class Bunker:
         m = BUNKER_LINE.search(line)
         if m:
             self.bunker_uri = m.group(1)
+        m = re.match(r"pubkey:\s*([0-9a-f]{64})", line)
+        if m:
+            st = load_state()
+            if st.get("user_pubkey") != m.group(1):
+                st["user_pubkey"] = m.group(1)
+                save_state(st)
         if line.startswith("listening at"):
             self.state, self.message = "running", ""
+            self.locked_since = None
+            self.episode_notice = None
             self.restarts = 0
             self.wrong_pw = False
         self.add_log(line)
@@ -347,12 +508,25 @@ class Bunker:
                 "bunker_uri": self.bunker_uri,
                 "started_at": self.started_at,
                 "log": list(self.log)[-80:],
+                "notify": notify_view(),
             }
+
+
+def notify_view():
+    st = load_state()
+    return {
+        "enabled": st.get("notify", True),
+        "ready": bool(HEX64.match(st.get("user_pubkey", ""))),
+        "from_npub": st.get("notifier_npub", ""),
+        "last": st.get("last_notice"),
+        "last_result": st.get("last_notice_result", ""),
+        "after_min": LOCK_NOTIFY_SECS // 60,
+    }
 
 
 def run_nak(args):
     # Runs in this container only; the key never leaves it.
-    out = subprocess.run([NAK] + args, capture_output=True, text=True, timeout=60,
+    out = subprocess.run([NAK] + args, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
                          env={"HOME": HOME, "PATH": "/usr/bin:/bin"})
     if out.returncode != 0:
         raise ValueError("nak failed: " + mask(out.stderr.strip())[:200])
@@ -360,6 +534,7 @@ def run_nak(args):
 
 
 BUNKER = Bunker()
+NOTIFIER = Notifier(BUNKER)
 
 # ---------------------------------------------------------------- web UI
 
@@ -385,11 +560,13 @@ if(s.state==='setup'){h+='<div class="c"><h2>Set up your key</h2><select id="mod
 if(s.state==='locked'){h+='<div class="c"><h2>Unlock</h2><input id="pw" type="password" autocomplete="current-password" placeholder="password" onkeydown="if(event.key===\\'Enter\\')unlock()"><label><input type="checkbox" id="rem" checked style="width:auto"> Keep unlocked until the app restarts (lets the bunker recover from nak restarts on its own)</label><button onclick="unlock()">Unlock</button></div>';}
 if(s.bunker_uri){h+='<div class="c"><h2>Connect a new app</h2><small>Paste this into the app you want to sign with. The secret is single-use and changes after each new connection.</small><p class="m" id="buri">'+esc(s.bunker_uri.replace(/secret=[^&]+/,'secret=••••••'))+'</p><button onclick="navigator.clipboard.writeText('+esc(JSON.stringify(s.bunker_uri))+');this.textContent=\\'Copied\\'">Copy bunker URI</button></div>';}
 if(s.state!=='setup'){h+='<div class="c"><h2>Relays</h2><ul>'+s.relays.map(r=>{const st=s.relay_status[r];return '<li class="m">'+esc(r)+' '+(st==='ok'?'<span class="ok">ok</span>':st?'<span class="bad">'+esc(st)+'</span>':'')+'</li>'}).join('')+'</ul><textarea id="rl" rows="4" onfocus="typing=true" onblur="typing=false">'+esc(s.relays.join('\\n'))+'</textarea><button onclick="relays()">Save relays and restart</button><br><small>Use at least 3. The bunker reconnects to dropped relays on its own.</small></div>';
-h+='<div class="c"><h2>Authorised apps</h2>'+(s.clients.length?'<ul>'+s.clients.map(c=>'<li><span class="m">'+esc(c.pubkey.slice(0,16))+'…</span> '+esc(c.name||'')+' <small>'+esc(c.url||'')+'</small> <button onclick="if(confirm(\\'Remove this app? It will need a new bunker URI to sign again.\\'))post(\\'api/client/remove\\',{pubkey:\\''+esc(c.pubkey)+'\\'})">Remove</button></li>').join('')+'</ul>':'<small>None yet.</small>')+'</div>';}
+h+='<div class="c"><h2>Authorised apps</h2>'+(s.clients.length?'<ul>'+s.clients.map(c=>'<li><span class="m">'+esc(c.pubkey.slice(0,16))+'…</span> '+esc(c.name||'')+' <small>'+esc(c.url||'')+'</small> <button onclick="if(confirm(\\'Remove this app? It will need a new bunker URI to sign again.\\'))post(\\'api/client/remove\\',{pubkey:\\''+esc(c.pubkey)+'\\'})">Remove</button></li>').join('')+'</ul>':'<small>None yet.</small>')+'</div>';
+const n=s.notify;h+='<div class="c"><h2>Locked reminders</h2><label><input type="checkbox" style="width:auto" '+(n.enabled?'checked':'')+' onchange="post(\'api/notify\',{enabled:this.checked?\'1\':\'\'})"> Send me an encrypted Nostr DM (NIP-17) if the bunker stays locked for '+n.after_min+' minutes, then once a day until it is unlocked</label>'+(n.ready?'':'<p><small>Available after the first unlock (that is how the bunker learns your npub).</small></p>')+(n.from_npub?'<p><small>Messages come from <span class="m">'+esc(n.from_npub)+'</span>, a key unique to this install. Add it as a contact if your app hides messages from strangers. Apps that only support older (NIP-04) DMs will not show them.</small></p>':'')+(n.last?'<p><small>Last message: '+esc(new Date(n.last*1000).toLocaleString())+' &middot; '+esc(n.last_result)+'</small></p>':'')+(n.ready?'<button onclick="testdm(this)">Send test DM</button>':'')+'</div>';}
 h+='<div class="c"><h2>Log</h2><pre>'+s.log.map(l=>esc(l[0]+'  '+l[1])).join('\\n')+'</pre></div>';
 $('#app').innerHTML=h;}
 function sm(){$('#kf').style.display=$('#mode').value==='generate'?'none':'block'}
 function setup(){post('api/setup',{mode:$('#mode').value,key:$('#key').value,password:$('#pw').value,relays:$('#rl').value})}
+async function testdm(b){b.disabled=true;b.textContent='Sending…';const r=await fetch('api/notify/test',{method:'POST',headers:{'X-CSRF':T}});const j=await r.json().catch(()=>({}));alert(r.ok?j.message:(j.error||r.status));load();}
 function unlock(){post('api/unlock',{password:$('#pw').value,remember:$('#rem').checked?'1':''})}
 function relays(){typing=false;post('api/relays',{relays:$('#rl').value})}
 document.addEventListener('focusin',e=>{if(e.target.matches('input,textarea,select'))typing=true});
@@ -455,6 +632,15 @@ class Handler(BaseHTTPRequestHandler):
                              parse_relays(form.get("relays")))
             elif self.path == "/api/relays":
                 BUNKER.set_relays(parse_relays(form.get("relays")))
+            elif self.path == "/api/notify":
+                st = load_state()
+                st["notify"] = bool(form.get("enabled"))
+                save_state(st)
+            elif self.path == "/api/notify/test":
+                ok, tried, where = NOTIFIER.send("Test from nak bunker: locked reminders will reach you here.")
+                if ok == 0:
+                    raise ValueError(f"No relay accepted the test message (tried {tried}: {where}).")
+                return self._json(200, {"ok": True, "message": f"Sent. {ok}/{tried} relays accepted it ({where})."})
             elif self.path == "/api/client/remove":
                 pk = form.get("pubkey", "")
                 if not re.fullmatch(r"[0-9a-f]{64}", pk):
@@ -471,6 +657,7 @@ def main():
     os.makedirs(HOME, exist_ok=True)
     signal.signal(signal.SIGTERM, lambda *_: (setattr(BUNKER, "want_running", False), BUNKER.stop(), os._exit(0)))
     BUNKER.start()
+    threading.Thread(target=NOTIFIER.loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"nak bunker shim on :{PORT}", flush=True)
     srv.serve_forever()
