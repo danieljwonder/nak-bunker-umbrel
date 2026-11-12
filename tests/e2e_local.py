@@ -106,6 +106,11 @@ p, tok = start_shim(home)
 try:
     s = status()
     check("fresh install shows setup, nak not started", s["state"] == "setup")
+    js = re.search(r"<script>(.*)</script>", get("/"), re.S).group(1)
+    jsf = os.path.join(home, "page.js")
+    open(jsf, "w").write(js)
+    chk = subprocess.run(["node", "--check", jsf], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    check("page JavaScript parses", chk.returncode == 0, chk.stderr[-300:])
     check("POST without CSRF token refused", post("/api/setup", {"mode": "generate"}, None)[0] == 403)
     check("short password refused", post("/api/setup", {"mode": "generate", "password": "short", "relays": RELAYS}, tok)[0] == 400)
     check("bad ncryptsec password refused before saving",
