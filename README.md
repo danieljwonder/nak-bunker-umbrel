@@ -77,8 +77,17 @@ backup of your `ncryptsec`/`nsec`.
 
 - The web page is reachable only through Umbrel's app proxy (Umbrel login). State-changing
   requests also need a per-process CSRF token.
-- Importing an `nsec` or generating a key passes the key and password to `nak key encrypt` as
-  process arguments, inside this container only, for under a second.
+- Keys reach nak through stdin or the terminal, never as command-line arguments. The one
+  exception is the password during first setup: `nak key encrypt`/`decrypt` only accept it as an
+  argument, so it is visible in the process list for the under-a-second that step runs.
+  Unlocking after a restart types the password into nak's terminal instead.
+- The password is never written to disk. With "keep unlocked" on, it stays in memory until the
+  app restarts.
+- The app keeps its log in memory only (shown on the page), with passwords, keys and connection
+  secrets masked. Nothing secret goes to the container log.
+- The browser sends your password to Umbrel over whatever connection you use to open Umbrel.
+  On a plain `http://umbrel.local` connection that is unencrypted on your local network; use
+  Umbrel over Tailscale or HTTPS if that matters to you.
 - The `bunker://` URI shown on the page contains a single-use connection secret. Anyone with
   it can authorise one new client, so only paste it into apps you trust.
 

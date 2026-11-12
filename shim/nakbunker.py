@@ -463,7 +463,9 @@ class Bunker:
             if not key.startswith("ncryptsec1"):
                 raise ValueError("That is not an ncryptsec1… string.")
             try:
-                run_nak(["key", "decrypt", key, password])  # output discarded; checks the password
+                # key via stdin, not argv; output (the plain key) is discarded
+                if nak_io(["key", "decrypt", password], stdin=key + "\n")[0] != 0:
+                    raise ValueError("bad password")
             except ValueError:
                 raise ValueError("That password does not decrypt this ncryptsec.")
             ncs = key
@@ -472,7 +474,10 @@ class Bunker:
                 key = run_nak(["key", "generate"])
             elif not (key.startswith("nsec1") or re.fullmatch(r"[0-9a-f]{64}", key)):
                 raise ValueError("Paste an nsec1… or 64-character hex key.")
-            ncs = run_nak(["key", "encrypt", key, password])
+            # key via stdin so it never appears in a process list; nak only takes the password as an
+            # argument, for the under-a-second this setup step runs (unlocking uses the terminal)
+            code, out, _ = nak_io(["key", "encrypt", password], stdin=key + "\n")
+            ncs = out.strip() if code == 0 else ""
             if not ncs.startswith("ncryptsec1"):
                 raise ValueError("Encrypting the key failed.")
         write_config({"clients": None, "sec": ncs, "relays": relays})
